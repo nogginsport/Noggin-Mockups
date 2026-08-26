@@ -1,72 +1,97 @@
 # Noggin mock-up backend
 
-Small serverless service that generates the mock-up sets for the
-Shopify site's mock-up generator — 9 designs per free set (3 beanies,
-3 caps, 3 bucket hats). Kept separate from Shopify on purpose —
-Shopify can't run custom server code, so this is where the image-generation
-API key lives, where the free/email-gated limit is enforced, and where
-generated images get saved permanently (so a customer's choice still
-resolves correctly days later, not just in the minutes after generation).
+Generates real, accurate mock-ups for beanies, caps and bucket hats using
+your actual Photoshop templates — via [SudoMock](https://sudomock.com),
+which renders your `.psd` files directly rather than guessing with AI.
+Every render uses the customer's real uploaded logo and their two chosen
+colours (primary/secondary), mapped onto the exact layers we confirmed
+directly against your files.
 
-This is plain Node.js. Deploy it wherever you like — these steps assume
-Vercel since it's the fastest path.
+## What this produces
 
-## Deploy (Vercel)
+One free "generate" click returns **8 designs**: 3 beanie variations,
+2 cap variations, 3 bucket hat variations — each a genuine render of your
+real template, not an approximation.
 
-1. Push this folder to its own GitHub repo.
-2. Import it into Vercel (vercel.com → New Project).
-3. Add a Vercel KV store to the project (Storage tab → Create → KV) —
-   tracks free/email-gated usage per session, and which designs were
-   generated for that session.
-4. Add Vercel Blob storage to the project (Storage tab → Create → Blob) —
-   this is where generated images get saved permanently. Vercel wires up
-   the required token automatically.
-5. Add environment variables in Vercel project settings:
-   - `IMAGE_API_KEY` — your chosen image-generation provider's key
-   - `TIER_1_MODEL` — cheap model for the free first batch (optional, has a default)
-   - `TIER_2_MODEL` — better model for the email-gated batch (optional, has a default)
-6. Deploy. You'll get a URL like `https://noggin-mockups.vercel.app`.
-7. In the Shopify theme editor, open the "Mock-up generator" section:
-   - Paste `https://noggin-mockups.vercel.app/api/generate` into "Mock-up backend URL"
-   - Paste your Typeform URL into "Order form (Typeform) URL" — see below
+## Setup
 
-## Setting up the Typeform hand-off
+### 1. Upload your three PSDs to SudoMock
 
-The goal: when a customer picks their favourite of the 9 designs, they land
-on your order-details Typeform with that exact design already attached, so
-your team can see both the order details and the design together.
+In the SudoMock dashboard (PSD Mockup Editor → Upload), upload:
+- `3d_Beanie.psd` (with the `CROWN COLOR` / `CUFF COLOR` split done)
+- `Tiff_Baseball_.psd` (the cap, with `PEAK` activated)
+- `3D_Bucket_Hat_New_.psd`
 
-1. In the Typeform builder, go to **Settings → Hidden fields** and add
-   three hidden fields: `ref`, `design_url`, `product_type`.
-2. (Optional but recommended) Add a **Question** near the top of the form
-   that displays `{{hidden:design_url}}` so the customer sees a visual
-   confirmation of what they picked before continuing.
-3. That's it on the Typeform side — the theme's JS fills these fields
-   automatically via the URL when someone clicks "Choose this" under a
-   design.
-4. Every Typeform submission will now include the `design_url` — a
-   permanent link to the exact image the customer chose — right alongside
-   their quantity, delivery details, and contact info.
+Each one gets a **Mockup UUID** once uploaded — copy these down, you'll need
+them for step 3.
 
-## Getting submissions somewhere useful
+### 2. Deploy this backend to Vercel
 
-Typeform's own native integrations (Notifications, Google Sheets, Slack,
-Zapier/Make) can all pick up `design_url` as just another form field, so
-whichever one you choose will show the design link right there in the
-notification/row/message — no custom code needed for this part.
+Same process as before: push to GitHub, import into Vercel, connect KV and
+Blob storage (already done if you followed the earlier steps).
 
-## Before going live
+### 3. Set environment variables
 
-- [ ] Confirm which image-generation provider/model you're using and
-      update `api/generate.js` to match its actual API shape.
-- [ ] Wire up lead capture where marked with `TODO` (push tier-2 emails
-      into your CRM / mailing list).
-- [ ] Add CORS headers restricting this endpoint to your actual Shopify
-      domain, not `*`.
-- [ ] Add basic file-type/size validation on the uploaded logo.
-- [ ] Load-test the rate limiter — it's keyed on a client-generated
-      session ID stored in sessionStorage, which is enough to stop casual
-      abuse but not a determined bad actor; add an IP-based backstop if
-      that becomes a problem in practice.
-- [ ] Build the Typeform, add the 3 hidden fields above, and test the
-      full click-through from a generated design.
+In Vercel → Settings → Environment Variables, add:
+
+| Variable | Value |
+|---|---|
+| `SUDOMOCK_API_KEY` | From SudoMock → API Keys |
+| `SUDOMOCK_BEANIE_MOCKUP_UUID` | From step 1 |
+| `SUDOMOCK_CAP_MOCKUP_UUID` | From step 1 |
+| `SUDOMOCK_BUCKET_HAT_MOCKUP_UUID` | From step 1 |
+
+### 4. Important: check the bucket hat's logo layer name
+
+The bucket hat has **three layers all named "BUCKET HAT DESIGN"** (Photoshop
+allows duplicate names). `_mockup-config.js` currently assumes it can find
+the crest layer as `"BUCKET HAT DESIGN 3"`, which **will not match** unless
+you rename that specific layer in Photoshop first.
+
+**Before going live**: open `3D_Bucket_Hat_New_.psd`, find the *third*
+"BUCKET HAT DESIGN" layer (the one confirmed as the crest position), and
+rename it to something unique — e.g. `BUCKET HAT CREST`. Then update
+`logoLayerName` in `api/_mockup-config.js` to match. Skipping this step
+will cause bucket hat renders to fail with a clear "layer not found" error
+rather than silently using the wrong layer — but it does need fixing before
+launch.
+
+### 5. Redeploy
+
+Once the env vars and layer rename are done, redeploy so everything picks
+up the new configuration.
+
+## How the colour zones work
+
+See `api/_mockup-config.js` — it's the single source of truth mapping each
+product's real Photoshop layers to "primary" or "secondary" across the
+different variations. If you ever want to adjust which layer gets which
+colour, or add more variations, that's the only file you need to touch.
+
+## The beanie's band
+
+The striped band ("TOP LABEL") lives inside a nested Smart Object that
+SudoMock can't reach into directly. Rather than restructuring that Smart
+Object in Photoshop, `api/_build-band.js` builds the band as a flat image
+at request time — the customer's secondary colour, with the real "noggin"
+wordmark (exported once, stored in `/assets/noggin-wordmark.png`)
+composited on top — and sends that as the replacement image. No Photoshop
+changes needed for this part.
+
+## Testing before going live
+
+1. Upload a real logo through the Shopify site once this is all wired up.
+2. Check all 8 renders actually reflect your chosen colours and the real logo.
+3. Specifically check the bucket hat crest lands in the right spot (this is
+   the one area with a naming ambiguity — see step 4 above).
+4. Check the beanie's band looks right — flat colour + wordmark, sized
+   sensibly. If the wordmark looks too big/small, adjust the `0.55` ratio
+   in `_build-band.js`.
+
+## Getting submissions to Monday.com
+
+Once a customer picks their favourite design, they're sent to your Typeform
+with `design_url`, `product_type`, and `ref` (session ID) as hidden fields
+— see the earlier setup notes. Typeform's native Monday.com integration can
+map `design_url` straight into a Link-type column so your team can click
+straight through to the exact design.
