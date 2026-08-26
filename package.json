@@ -1,0 +1,11 @@
+{
+  "name": "noggin-mockup-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Server-side mock-up generation for Noggin. Holds the image-generation API key and enforces the free-tier rate limit. Deploy to Vercel.",
+  "dependencies": {
+    "@vercel/kv": "^2.0.0",
+    "@vercel/blob": "^0.27.0",
+    "formidable": "^3.5.1"
+  }
+}
