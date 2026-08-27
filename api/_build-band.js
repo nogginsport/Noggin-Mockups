@@ -9,12 +9,19 @@
 // alongside this file) placed on top. This whole image then gets sent to
 // SudoMock as the replacement asset for that Smart Object slot.
 //
+// Uses jimp (pure JavaScript, no compiled/native dependencies) rather than
+// sharp — sharp relies on native bindings that can fail to load correctly
+// on some serverless deployments, silently crashing the whole function
+// before it can even respond. jimp trades a little speed for being
+// reliably deployable anywhere, which matters more for a low-volume
+// endpoint like this one.
+//
 // The wordmark and piping lines automatically switch between white and
 // near-black depending on how light/dark the chosen band colour is — this
 // keeps the "usually white" look customers like on typical (darker) team
 // colours, while staying readable if someone ever picks something pale.
 
-const sharp = require('sharp');
+const { Jimp, JimpMime } = require('jimp');
 const path = require('path');
 
 const WORDMARK_PATH = path.join(__dirname, '..', 'assets', 'noggin-wordmark.png');
@@ -26,88 +33,61 @@ const WORDMARK_PATH = path.join(__dirname, '..', 'assets', 'noggin-wordmark.png'
  * @returns {Promise<Buffer>} PNG image buffer
  */
 async function buildBandImage(hexColour, width, height) {
-  const rgb = hexToRgb(hexColour);
-  const detailColour = pickContrastColour(rgb); // '#FFFFFF' or '#141414'
+  const bgHex = hexToJimpInt(hexColour);
+  const detailHex = pickContrastColour(hexToRgb(hexColour)); // 0xFFFFFFFF or 0x141414FF
 
-  const background = await sharp({
-    create: {
-      width,
-      height,
-      channels: 4,
-      background: { r: rgb.r, g: rgb.g, b: rgb.b, alpha: 1 },
-    },
-  })
-    .png()
-    .toBuffer();
-
-  const composites = [];
+  const canvas = new Jimp({ width, height, color: bgHex });
 
   // Thin piping lines near the top and bottom edges of the band.
   const lineHeight = Math.max(2, Math.round(height * 0.02));
   const lineInset = Math.round(height * 0.12);
-  const lineSvg = Buffer.from(
-    `<svg width="${width}" height="${lineHeight}"><rect width="100%" height="100%" fill="${detailColour}"/></svg>`
-  );
-  composites.push({ input: lineSvg, left: 0, top: lineInset });
-  composites.push({ input: lineSvg, left: 0, top: height - lineInset - lineHeight });
+  const lineImg = new Jimp({ width, height: lineHeight, color: detailHex });
+  canvas.composite(lineImg, 0, lineInset);
+  canvas.composite(lineImg, 0, height - lineInset - lineHeight);
 
   // Wordmark, recoloured to match the chosen contrast colour, sized to
   // ~55% of the band's width and centred.
   const wordmarkWidth = Math.round(width * 0.55);
-  const recolouredWordmark = await recolourWordmark(detailColour, wordmarkWidth);
-  const wordmarkMeta = await sharp(recolouredWordmark).metadata();
-  composites.push({
-    input: recolouredWordmark,
-    left: Math.round((width - wordmarkMeta.width) / 2),
-    top: Math.round((height - wordmarkMeta.height) / 2),
-  });
+  const recolouredWordmark = await recolourWordmark(detailHex, wordmarkWidth);
+  canvas.composite(
+    recolouredWordmark,
+    Math.round((width - recolouredWordmark.width) / 2),
+    Math.round((height - recolouredWordmark.height) / 2)
+  );
 
-  const composited = await sharp(background)
-    .composite(composites)
-    .png()
-    .toBuffer();
-
-  return composited;
+  return canvas.getBuffer(JimpMime.png);
 }
 
 /**
  * The source wordmark PNG is white letters on transparency. To recolour
- * it, we use its alpha channel as a mask over a solid fill of the target
- * colour — this works regardless of what colour the source happens to be.
+ * it, we tint every non-transparent pixel to the target colour, preserving
+ * the original alpha (so the letter shapes stay exactly as exported).
  */
-async function recolourWordmark(hexColour, targetWidth) {
-  const rgb = hexToRgb(hexColour);
+async function recolourWordmark(colourHex, targetWidth) {
+  const img = await Jimp.read(WORDMARK_PATH);
+  img.resize({ w: targetWidth });
 
-  const resized = await sharp(WORDMARK_PATH)
-    .resize({ width: targetWidth, fit: 'inside' })
-    .ensureAlpha()
-    .toBuffer();
+  const targetRgba = {
+    r: (colourHex >>> 24) & 0xff,
+    g: (colourHex >>> 16) & 0xff,
+    b: (colourHex >>> 8) & 0xff,
+  };
 
-  const meta = await sharp(resized).metadata();
+  img.scan(0, 0, img.width, img.height, function (x, y, idx) {
+    // Keep this pixel's own alpha (idx + 3), just replace the colour.
+    this.bitmap.data[idx] = targetRgba.r;
+    this.bitmap.data[idx + 1] = targetRgba.g;
+    this.bitmap.data[idx + 2] = targetRgba.b;
+  });
 
-  const solidFill = await sharp({
-    create: {
-      width: meta.width,
-      height: meta.height,
-      channels: 4,
-      background: { r: rgb.r, g: rgb.g, b: rgb.b, alpha: 1 },
-    },
-  })
-    .png()
-    .toBuffer();
-
-  // Use the wordmark's own alpha as a mask, applied to the solid fill.
-  return sharp(solidFill)
-    .composite([{ input: resized, blend: 'dest-in' }])
-    .png()
-    .toBuffer();
+  return img;
 }
 
 function pickContrastColour(rgb) {
   // Standard relative luminance formula — decides if the background
   // reads as "light" or "dark" to the eye.
   const luminance = (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) / 255;
-  return luminance > 0.55 ? '#141414' : '#FFFFFF';
+  return luminance > 0.55 ? 0x141414ff : 0xffffffff;
 }
 
 function hexToRgb(hex) {
@@ -119,5 +99,9 @@ function hexToRgb(hex) {
   };
 }
 
-module.exports = { buildBandImage };
+function hexToJimpInt(hex) {
+  const rgb = hexToRgb(hex);
+  return ((rgb.r << 24) | (rgb.g << 16) | (rgb.b << 8) | 0xff) >>> 0;
+}
 
+module.exports = { buildBandImage };
