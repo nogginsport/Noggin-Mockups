@@ -9,7 +9,7 @@
 // rendered from Noggin's real Photoshop templates via SudoMock. See
 // _mockup-config.js for exactly which layer gets which colour.
 
-const formidable = require('formidable');
+const { formidable } = require('formidable');
 const fs = require('fs');
 const { kv } = require('@vercel/kv');
 const { put } = require('@vercel/blob');
