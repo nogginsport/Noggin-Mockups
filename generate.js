@@ -8,6 +8,16 @@
 // using the customer's actual uploaded logo and their two chosen colours,
 // rendered from Noggin's real Photoshop templates via SudoMock. See
 // _mockup-config.js for exactly which layer gets which colour.
+//
+// IMPORTANT: the entire body of this handler runs inside one big try/catch
+// (see bottom of file). This is deliberate — CORS headers are set right at
+// the top, but if anything after that throws uncaught, the platform's own
+// error page can replace our response and silently drop those headers,
+// which shows up in the browser as a bare "Failed to fetch" with zero
+// information about what actually went wrong. Wrapping everything, and
+// putting a timeout on every external call, guarantees we always send back
+// a real JSON response with the headers intact — even when something
+// upstream (KV, Blob, SudoMock) is slow, misconfigured, or unreachable.
 
 const { formidable } = require('formidable');
 const fs = require('fs');
@@ -17,19 +27,17 @@ const { getMockup, render, findSmartObjectByName } = require('./_sudomock-client
 const { buildBandImage } = require('./_build-band');
 const { PRODUCTS, PRODUCT_VARIATIONS } = require('./_mockup-config');
 
+const EXTERNAL_CALL_TIMEOUT_MS = 15000;
+
 module.exports = async (req, res) => {
-  // CORS — required for the browser to accept this response at all, since
-  // the request comes from a different origin (Shopify's domain, or a
-  // local test file) than this API lives on. Without these headers, the
-  // browser silently blocks the response even though the server processed
-  // the request successfully — this was the actual cause of "nothing
-  // happens" during testing.
+  // CORS — set FIRST, before anything that could possibly throw, and again
+  // this is why the whole rest of the function is wrapped below: nothing
+  // that happens later is allowed to prevent a real, headers-intact
+  // response from being sent.
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Browsers send a preflight OPTIONS request before the real POST for
-  // requests like this one — must respond successfully to it, with no body.
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
@@ -38,12 +46,34 @@ module.exports = async (req, res) => {
     return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'Use POST.' });
   }
 
+  try {
+    return await handlePost(req, res);
+  } catch (err) {
+    // Absolute last resort — should rarely fire given the handling inside
+    // handlePost, but guarantees we NEVER return a bare crash with no
+    // CORS headers, no matter what goes wrong.
+    console.error('UNCAUGHT top-level error:', err);
+    if (!res.headersSent) {
+      return res.status(500).json({
+        code: 'INTERNAL_ERROR',
+        message: 'Something went wrong generating your mock-ups.',
+        debug: String((err && err.message) || err),
+      });
+    }
+  }
+};
+
+module.exports.config = {
+  api: { bodyParser: false },
+};
+
+async function handlePost(req, res) {
   let fields, files;
   try {
-    ({ fields, files } = await parseForm(req));
+    ({ fields, files } = await withTimeout(parseForm(req), EXTERNAL_CALL_TIMEOUT_MS, 'Reading the upload'));
   } catch (err) {
     console.error('Upload parsing failed:', err);
-    return res.status(400).json({ code: 'BAD_REQUEST', message: 'Could not read upload.', debug: String(err && err.message || err) });
+    return res.status(400).json({ code: 'BAD_REQUEST', message: 'Could not read upload.', debug: String((err && err.message) || err) });
   }
 
   const sessionId = String(fields.sessionId || '').trim();
@@ -64,7 +94,13 @@ module.exports = async (req, res) => {
 
   // --- Server-side rate limit ---
   const usageKey = `noggin:mockup:${sessionId}`;
-  const usage = (await kv.get(usageKey)) || { tier1Used: false, tier2Used: false };
+  let usage;
+  try {
+    usage = (await withTimeout(kv.get(usageKey), EXTERNAL_CALL_TIMEOUT_MS, 'Checking session storage')) || { tier1Used: false, tier2Used: false };
+  } catch (err) {
+    console.error('KV read failed:', err);
+    return res.status(502).json({ code: 'STORAGE_ERROR', message: 'Could not reach session storage.', debug: String((err && err.message) || err) });
+  }
 
   if (tier === '1' && usage.tier1Used) {
     return res.status(429).json({ code: 'LIMIT_REACHED', message: "You've already used your free set for this session. Add your email for more." });
@@ -77,14 +113,15 @@ module.exports = async (req, res) => {
   let logoUrl;
   try {
     const logoBuffer = fs.readFileSync(logoFile.filepath);
-    const blob = await put(`logos/${sessionId}-${Date.now()}.png`, logoBuffer, {
-      access: 'public',
-      contentType: logoFile.mimetype || 'image/png',
-    });
+    const blob = await withTimeout(
+      put(`logos/${sessionId}-${Date.now()}.png`, logoBuffer, { access: 'public', contentType: logoFile.mimetype || 'image/png' }),
+      EXTERNAL_CALL_TIMEOUT_MS,
+      'Uploading your logo'
+    );
     logoUrl = blob.url;
   } catch (err) {
-    console.error('Logo upload failed', err);
-    return res.status(502).json({ code: 'UPLOAD_FAILED', message: 'Could not process your logo.' });
+    console.error('Logo upload failed:', err);
+    return res.status(502).json({ code: 'UPLOAD_FAILED', message: 'Could not process your logo.', debug: String((err && err.message) || err) });
   }
 
   // --- Generate all 8 designs ---
@@ -92,8 +129,8 @@ module.exports = async (req, res) => {
   try {
     designs = await generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessionId });
   } catch (err) {
-    console.error('Mock-up generation failed', err);
-    return res.status(502).json({ code: 'GENERATION_FAILED', message: 'Could not generate mock-ups right now.' });
+    console.error('Mock-up generation failed:', err);
+    return res.status(502).json({ code: 'GENERATION_FAILED', message: 'Could not generate mock-ups right now.', debug: String((err && err.message) || err) });
   }
 
   // --- Record usage + lead ---
@@ -104,7 +141,13 @@ module.exports = async (req, res) => {
     // TODO: push `email` + sessionId into your CRM/mailing list here.
   }
   usage.designs = (usage.designs || []).concat(designs);
-  await kv.set(usageKey, usage, { ex: 60 * 60 * 24 * 30 });
+  try {
+    await withTimeout(kv.set(usageKey, usage, { ex: 60 * 60 * 24 * 30 }), EXTERNAL_CALL_TIMEOUT_MS, 'Saving session storage');
+  } catch (err) {
+    // Don't fail the whole request over this — the customer already has
+    // their designs, worst case the rate limit doesn't stick this once.
+    console.error('KV write failed (non-fatal):', err);
+  }
 
   return res.status(200).json({
     images: designs.map((d) => d.url),
@@ -113,11 +156,7 @@ module.exports = async (req, res) => {
       ? 'Here are your free concepts — 3 beanies, 2 caps and 3 bucket hats.'
       : "Here's your next set — thanks, we'll be in touch.",
   });
-};
-
-module.exports.config = {
-  api: { bodyParser: false },
-};
+}
 
 function parseForm(req) {
   return new Promise((resolve, reject) => {
@@ -129,6 +168,14 @@ function parseForm(req) {
   });
 }
 
+/** Wraps any promise so it rejects with a clear message instead of hanging forever. */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
 async function generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessionId }) {
   const designs = [];
 
@@ -138,7 +185,7 @@ async function generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessi
       throw new Error(`Missing env var ${config.mockupUuidEnvVar} — upload the ${productKey} PSD to SudoMock and set its mockup UUID.`);
     }
 
-    const mockupData = await getMockup(mockupUuid);
+    const mockupData = await withTimeout(getMockup(mockupUuid), EXTERNAL_CALL_TIMEOUT_MS, `Fetching ${productKey} mockup data`);
     const variationKeys = config.variationCount === 2
       ? PRODUCT_VARIATIONS.slice(0, 2)
       : PRODUCT_VARIATIONS;
@@ -147,34 +194,30 @@ async function generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessi
       const zoneAssignment = config.colourZones[variationKey];
       const smartObjects = [];
 
-      // Colour zones — resolve each named layer to its uuid, set the hex.
       for (const [layerName, whichColour] of Object.entries(zoneAssignment)) {
-        // The beanie's band is handled separately below via image compositing,
-        // not a plain colour zone — skip it here.
         if (layerName === 'TOP LABEL BAND') continue;
         const so = findSmartObjectByName(mockupData, layerName);
         const hex = whichColour === 'primary' ? primaryColor : secondaryColor;
         smartObjects.push({ uuid: so.uuid, color: { hex } });
       }
 
-      // Beanie's composited band (wordmark + flat colour) — built fresh per variation.
       if (config.hasCompositeBand) {
         const bandLayer = findSmartObjectByName(mockupData, 'TOP LABEL');
         const bandColourKey = zoneAssignment['TOP LABEL BAND'];
         const bandHex = bandColourKey === 'primary' ? primaryColor : secondaryColor;
         const bandImageBuffer = await buildBandImage(bandHex, bandLayer.size.width, bandLayer.size.height);
-        const bandBlob = await put(`bands/${sessionId}-${productKey}-${variationKey}-${Date.now()}.png`, bandImageBuffer, {
-          access: 'public',
-          contentType: 'image/png',
-        });
+        const bandBlob = await withTimeout(
+          put(`bands/${sessionId}-${productKey}-${variationKey}-${Date.now()}.png`, bandImageBuffer, { access: 'public', contentType: 'image/png' }),
+          EXTERNAL_CALL_TIMEOUT_MS,
+          'Uploading generated band image'
+        );
         smartObjects.push({ uuid: bandLayer.uuid, asset: { url: bandBlob.url, fit: 'fill' } });
       }
 
-      // Customer's logo.
       const logoLayer = findSmartObjectByName(mockupData, config.logoLayerName);
       smartObjects.push({ uuid: logoLayer.uuid, asset: { url: logoUrl, fit: 'fit' } });
 
-      const renderedUrl = await render(mockupUuid, smartObjects);
+      const renderedUrl = await withTimeout(render(mockupUuid, smartObjects), EXTERNAL_CALL_TIMEOUT_MS, `Rendering ${productKey} ${variationKey}`);
       designs.push({ url: renderedUrl, productType: productKey, variation: variationKey });
     }
   }
