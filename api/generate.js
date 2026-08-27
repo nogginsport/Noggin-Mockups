@@ -18,6 +18,22 @@ const { buildBandImage } = require('./_build-band');
 const { PRODUCTS, PRODUCT_VARIATIONS } = require('./_mockup-config');
 
 module.exports = async (req, res) => {
+  // CORS — required for the browser to accept this response at all, since
+  // the request comes from a different origin (Shopify's domain, or a
+  // local test file) than this API lives on. Without these headers, the
+  // browser silently blocks the response even though the server processed
+  // the request successfully — this was the actual cause of "nothing
+  // happens" during testing.
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  // Browsers send a preflight OPTIONS request before the real POST for
+  // requests like this one — must respond successfully to it, with no body.
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'Use POST.' });
   }

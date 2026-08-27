@@ -45,7 +45,7 @@ const PRODUCTS = {
 
   bucketHat: {
     mockupUuidEnvVar: 'SUDOMOCK_BUCKET_HAT_MOCKUP_UUID',
-    logoLayerName: 'BUCKET HAT DESIGN 3', // the 3rd "BUCKET HAT DESIGN" layer specifically — see naming note below
+    logoLayerName: 'BUCKET HAT CREST', // renamed from the ambiguous "BUCKET HAT DESIGN" (x3 duplicate names) — confirmed unique
     colourZones: {
       primaryLed:   { 'BUCKET HAT COLOR': 'primary', 'PART 1 COLOR': 'primary', 'PART 3 COLOR': 'primary', 'PART 4 COLOR': 'primary', 'PART 2 COLOR': 'secondary' },
       secondaryLed: { 'BUCKET HAT COLOR': 'secondary', 'PART 1 COLOR': 'secondary', 'PART 3 COLOR': 'secondary', 'PART 4 COLOR': 'secondary', 'PART 2 COLOR': 'primary' },
@@ -54,14 +54,9 @@ const PRODUCTS = {
   },
 };
 
-// NOTE on bucketHat.logoLayerName: SudoMock's upload response will return
-// all three "BUCKET HAT DESIGN" layers with the *same* layer_name (Photoshop
-// allowed duplicate names). You cannot reliably pick "the 3rd one" by name
-// alone from the API response — you need to disambiguate by position
-// (their `position` field in the upload response) or, better, rename the
-// crest layer something unique in Photoshop (e.g. "BUCKET HAT CREST") before
-// re-uploading. This is flagged as a TODO in generate.js below rather than
-// silently guessing wrong.
+// The bucket hat's crest layer was originally one of three identically-named
+// "BUCKET HAT DESIGN" layers — renamed to "BUCKET HAT CREST" in Photoshop
+// (confirmed via screenshot) to make it unambiguously identifiable here.
 
 const PRODUCT_VARIATIONS = ['primaryLed', 'secondaryLed', 'balanced'];
 

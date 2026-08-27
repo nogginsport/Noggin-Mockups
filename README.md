@@ -41,20 +41,12 @@ In Vercel → Settings → Environment Variables, add:
 | `SUDOMOCK_CAP_MOCKUP_UUID` | From step 1 |
 | `SUDOMOCK_BUCKET_HAT_MOCKUP_UUID` | From step 1 |
 
-### 4. Important: check the bucket hat's logo layer name
+### 4. Bucket hat crest layer — already renamed
 
-The bucket hat has **three layers all named "BUCKET HAT DESIGN"** (Photoshop
-allows duplicate names). `_mockup-config.js` currently assumes it can find
-the crest layer as `"BUCKET HAT DESIGN 3"`, which **will not match** unless
-you rename that specific layer in Photoshop first.
-
-**Before going live**: open `3D_Bucket_Hat_New_.psd`, find the *third*
-"BUCKET HAT DESIGN" layer (the one confirmed as the crest position), and
-rename it to something unique — e.g. `BUCKET HAT CREST`. Then update
-`logoLayerName` in `api/_mockup-config.js` to match. Skipping this step
-will cause bucket hat renders to fail with a clear "layer not found" error
-rather than silently using the wrong layer — but it does need fixing before
-launch.
+The bucket hat's crest layer has been renamed to `BUCKET HAT CREST` in
+Photoshop (confirmed) to avoid the ambiguity of three identically-named
+"BUCKET HAT DESIGN" layers. `_mockup-config.js` already references this
+exact name — no further action needed here.
 
 ### 5. Redeploy
 
