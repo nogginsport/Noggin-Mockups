@@ -1,24 +1,28 @@
 // api/generate.js
 //
 // POST /api/generate
-// Body: multipart/form-data — logo (file), primary_color, secondary_color
-//       (hex strings, e.g. "#4F6B3F"), tier ("1" | "2"), sessionId, email
+// Body: application/json — {
+//   logoBase64: "data:image/png;base64,...",
+//   logoMimeType: "image/png",
+//   primaryColor, secondaryColor (hex strings, e.g. "#4F6B3F"),
+//   tier ("1" | "2"), sessionId, email (tier 2 only)
+// }
+//
+// This deliberately sends the logo as base64 text inside a plain JSON body,
+// rather than a raw multipart/form-data file upload. After extensive
+// testing, requests WITHOUT a file worked correctly against the deployed
+// function, but requests WITH an actual binary file consistently failed
+// with no error information at all — pointing at something in how
+// Vercel's platform handles raw multipart/binary request bodies
+// specifically, rather than anything in our own code (verified working
+// correctly, with real files, in local simulation). Sending the file as
+// base64 text inside JSON avoids multipart parsing entirely, which is a
+// well-established, more portable pattern for exactly this situation.
 //
 // Produces 8 renders per free set: 3 beanies, 2 caps, 3 bucket hats — each
 // using the customer's actual uploaded logo and their two chosen colours,
 // rendered from Noggin's real Photoshop templates via SudoMock. See
 // _mockup-config.js for exactly which layer gets which colour.
-//
-// IMPORTANT: every require() below is deliberately done INSIDE the handler,
-// not at the top of the file. If a dependency fails to load correctly on
-// Vercel's specific build/bundling system (even if it works fine in local
-// testing), a top-level require() failure crashes the entire module before
-// any of our own error handling ever gets a chance to run — Vercel's own
-// platform error page replaces our response, silently dropping the CORS
-// headers, which is exactly what a bare "Failed to fetch" looks like from
-// the browser with zero information about the real cause. Requiring lazily,
-// inside the try/catch below, means even a broken/missing dependency comes
-// back as a real, readable JSON error instead of a silent total failure.
 
 const EXTERNAL_CALL_TIMEOUT_MS = 15000;
 
@@ -35,11 +39,8 @@ module.exports = async (req, res) => {
     return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'Use POST.' });
   }
 
-  // Load every dependency here, inside the try/catch — see note above.
-  let formidable, fs, kv, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS;
+  let kv, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS;
   try {
-    ({ formidable } = require('formidable'));
-    fs = require('fs');
     ({ kv } = require('@vercel/kv'));
     ({ put } = require('@vercel/blob'));
     ({ getMockup, render, findSmartObjectByName } = require('./_sudomock-client'));
@@ -47,59 +48,56 @@ module.exports = async (req, res) => {
     ({ PRODUCTS, PRODUCT_VARIATIONS } = require('./_mockup-config'));
   } catch (err) {
     console.error('DEPENDENCY LOAD FAILURE:', err);
-    return res.status(500).json({
-      code: 'DEPENDENCY_ERROR',
-      message: 'A required module failed to load on the server.',
-      debug: String((err && err.stack) || (err && err.message) || err),
-    });
+    return res.status(500).json({ code: 'DEPENDENCY_ERROR', message: 'A required module failed to load on the server.', debug: String((err && err.stack) || err) });
   }
 
   try {
-    return await handlePost(req, res, { formidable, fs, kv, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS });
+    return await handlePost(req, res, { kv, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS });
   } catch (err) {
     console.error('UNCAUGHT top-level error:', err);
     if (!res.headersSent) {
-      return res.status(500).json({
-        code: 'INTERNAL_ERROR',
-        message: 'Something went wrong generating your mock-ups.',
-        debug: String((err && err.stack) || (err && err.message) || err),
-      });
+      return res.status(500).json({ code: 'INTERNAL_ERROR', message: 'Something went wrong generating your mock-ups.', debug: String((err && err.stack) || err) });
     }
   }
 };
 
-module.exports.config = {
-  api: { bodyParser: false },
-};
-
 async function handlePost(req, res, deps) {
-  const { formidable, fs, kv, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS } = deps;
+  const { kv, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS } = deps;
 
-  let fields, files;
+  let body;
   try {
-    ({ fields, files } = await withTimeout(parseForm(req, formidable), EXTERNAL_CALL_TIMEOUT_MS, 'Reading the upload'));
+    body = await readJsonBody(req);
   } catch (err) {
-    console.error('Upload parsing failed:', err);
-    return res.status(400).json({ code: 'BAD_REQUEST', message: 'Could not read upload.', debug: String((err && err.message) || err) });
+    console.error('Body parsing failed:', err);
+    return res.status(400).json({ code: 'BAD_REQUEST', message: 'Could not read request body.', debug: String((err && err.message) || err) });
   }
 
-  const sessionId = String(fields.sessionId || '').trim();
-  const tier = String(fields.tier || '1').trim();
-  const email = fields.email ? String(fields.email).trim() : null;
-  const primaryColor = String(fields.primary_color || '').trim();
-  const secondaryColor = String(fields.secondary_color || '').trim();
-  const logoFile = files.logo;
+  const sessionId = String(body.sessionId || '').trim();
+  const tier = String(body.tier || '1').trim();
+  const email = body.email ? String(body.email).trim() : null;
+  const primaryColor = String(body.primaryColor || '').trim();
+  const secondaryColor = String(body.secondaryColor || '').trim();
+  const logoBase64 = body.logoBase64;
+  const logoMimeType = body.logoMimeType || 'image/png';
 
   if (!sessionId) return res.status(400).json({ code: 'BAD_REQUEST', message: 'Missing session.' });
-  if (!logoFile) return res.status(400).json({ code: 'BAD_REQUEST', message: 'Missing logo file.' });
+  if (!logoBase64) return res.status(400).json({ code: 'BAD_REQUEST', message: 'Missing logo file.' });
   if (!/^#[0-9A-Fa-f]{6}$/.test(primaryColor) || !/^#[0-9A-Fa-f]{6}$/.test(secondaryColor)) {
-    return res.status(400).json({ code: 'BAD_REQUEST', message: 'primary_color and secondary_color must be hex, e.g. #4F6B3F.' });
+    return res.status(400).json({ code: 'BAD_REQUEST', message: 'primaryColor and secondaryColor must be hex, e.g. #4F6B3F.' });
   }
   if (tier === '2' && !email) {
     return res.status(400).json({ code: 'EMAIL_REQUIRED', message: 'Add your email to unlock more designs.' });
   }
 
-  // --- Server-side rate limit ---
+  let logoBuffer;
+  try {
+    const base64Data = logoBase64.replace(/^data:[^;]+;base64,/, '');
+    logoBuffer = Buffer.from(base64Data, 'base64');
+    if (logoBuffer.length === 0) throw new Error('Decoded logo is empty.');
+  } catch (err) {
+    return res.status(400).json({ code: 'BAD_REQUEST', message: 'Could not decode logo image.', debug: String((err && err.message) || err) });
+  }
+
   const usageKey = `noggin:mockup:${sessionId}`;
   let usage;
   try {
@@ -116,12 +114,10 @@ async function handlePost(req, res, deps) {
     return res.status(429).json({ code: 'LIMIT_REACHED', message: "You've already unlocked your second set for this session." });
   }
 
-  // --- Upload the customer's logo once, reuse the URL across every render ---
   let logoUrl;
   try {
-    const logoBuffer = fs.readFileSync(logoFile.filepath);
     const blob = await withTimeout(
-      put(`logos/${sessionId}-${Date.now()}.png`, logoBuffer, { access: 'public', contentType: logoFile.mimetype || 'image/png' }),
+      put(`logos/${sessionId}-${Date.now()}.png`, logoBuffer, { access: 'public', contentType: logoMimeType }),
       EXTERNAL_CALL_TIMEOUT_MS,
       'Uploading your logo'
     );
@@ -131,7 +127,6 @@ async function handlePost(req, res, deps) {
     return res.status(502).json({ code: 'UPLOAD_FAILED', message: 'Could not process your logo.', debug: String((err && err.message) || err) });
   }
 
-  // --- Generate all 8 designs ---
   let designs;
   try {
     designs = await generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessionId, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS });
@@ -140,19 +135,15 @@ async function handlePost(req, res, deps) {
     return res.status(502).json({ code: 'GENERATION_FAILED', message: 'Could not generate mock-ups right now.', debug: String((err && err.message) || err) });
   }
 
-  // --- Record usage + lead ---
   if (tier === '1') usage.tier1Used = true;
   if (tier === '2') {
     usage.tier2Used = true;
     usage.email = email;
-    // TODO: push `email` + sessionId into your CRM/mailing list here.
   }
   usage.designs = (usage.designs || []).concat(designs);
   try {
     await withTimeout(kv.set(usageKey, usage, { ex: 60 * 60 * 24 * 30 }), EXTERNAL_CALL_TIMEOUT_MS, 'Saving session storage');
   } catch (err) {
-    // Don't fail the whole request over this — the customer already has
-    // their designs, worst case the rate limit doesn't stick this once.
     console.error('KV write failed (non-fatal):', err);
   }
 
@@ -165,17 +156,21 @@ async function handlePost(req, res, deps) {
   });
 }
 
-function parseForm(req, formidable) {
+function readJsonBody(req) {
   return new Promise((resolve, reject) => {
-    const form = formidable({ multiples: false });
-    form.parse(req, (err, fields, files) => {
-      if (err) return reject(err);
-      resolve({ fields, files });
+    let data = '';
+    req.on('data', (chunk) => { data += chunk; });
+    req.on('end', () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch (err) {
+        reject(err);
+      }
     });
+    req.on('error', reject);
   });
 }
 
-/** Wraps any promise so it rejects with a clear message instead of hanging forever. */
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -193,9 +188,7 @@ async function generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessi
     }
 
     const mockupData = await withTimeout(getMockup(mockupUuid), EXTERNAL_CALL_TIMEOUT_MS, `Fetching ${productKey} mockup data`);
-    const variationKeys = config.variationCount === 2
-      ? PRODUCT_VARIATIONS.slice(0, 2)
-      : PRODUCT_VARIATIONS;
+    const variationKeys = config.variationCount === 2 ? PRODUCT_VARIATIONS.slice(0, 2) : PRODUCT_VARIATIONS;
 
     for (const variationKey of variationKeys) {
       const zoneAssignment = config.colourZones[variationKey];
