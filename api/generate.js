@@ -42,7 +42,8 @@ module.exports = async (req, res) => {
   try {
     ({ fields, files } = await parseForm(req));
   } catch (err) {
-    return res.status(400).json({ code: 'BAD_REQUEST', message: 'Could not read upload.' });
+    console.error('Upload parsing failed:', err);
+    return res.status(400).json({ code: 'BAD_REQUEST', message: 'Could not read upload.', debug: String(err && err.message || err) });
   }
 
   const sessionId = String(fields.sessionId || '').trim();
