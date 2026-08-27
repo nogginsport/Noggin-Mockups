@@ -81,7 +81,22 @@ async function handlePost(req, res, deps) {
   const logoMimeType = body.logoMimeType || 'image/png';
 
   if (!sessionId) return res.status(400).json({ code: 'BAD_REQUEST', message: 'Missing session.' });
-  if (!logoBase64) return res.status(400).json({ code: 'BAD_REQUEST', message: 'Missing logo file.' });
+  if (!logoBase64) {
+    // Diagnostic info — shows exactly what the server actually received,
+    // so we can see if the body was parsed correctly but this one field
+    // was missing, or if something more fundamental went wrong.
+    return res.status(400).json({
+      code: 'BAD_REQUEST',
+      message: 'Missing logo file.',
+      debug: {
+        receivedKeys: Object.keys(body || {}),
+        bodyType: typeof body,
+        sessionIdReceived: sessionId,
+        logoBase64Type: typeof body.logoBase64,
+        rawBodyPreview: JSON.stringify(body).slice(0, 200),
+      },
+    });
+  }
   if (!/^#[0-9A-Fa-f]{6}$/.test(primaryColor) || !/^#[0-9A-Fa-f]{6}$/.test(secondaryColor)) {
     return res.status(400).json({ code: 'BAD_REQUEST', message: 'primaryColor and secondaryColor must be hex, e.g. #4F6B3F.' });
   }
@@ -157,6 +172,16 @@ async function handlePost(req, res, deps) {
 }
 
 function readJsonBody(req) {
+  // Vercel's Node.js runtime sometimes automatically parses JSON request
+  // bodies into req.body before our handler ever runs, which would leave
+  // the raw stream already drained by the time we try to read it manually
+  // below — silently producing an empty result with no error. Checking
+  // for this first covers that case; the manual stream read remains as a
+  // fallback for when it's not already parsed.
+  if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+    return Promise.resolve(req.body);
+  }
+
   return new Promise((resolve, reject) => {
     let data = '';
     req.on('data', (chunk) => { data += chunk; });
