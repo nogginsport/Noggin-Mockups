@@ -9,31 +9,20 @@
 // rendered from Noggin's real Photoshop templates via SudoMock. See
 // _mockup-config.js for exactly which layer gets which colour.
 //
-// IMPORTANT: the entire body of this handler runs inside one big try/catch
-// (see bottom of file). This is deliberate — CORS headers are set right at
-// the top, but if anything after that throws uncaught, the platform's own
-// error page can replace our response and silently drop those headers,
-// which shows up in the browser as a bare "Failed to fetch" with zero
-// information about what actually went wrong. Wrapping everything, and
-// putting a timeout on every external call, guarantees we always send back
-// a real JSON response with the headers intact — even when something
-// upstream (KV, Blob, SudoMock) is slow, misconfigured, or unreachable.
-
-const { formidable } = require('formidable');
-const fs = require('fs');
-const { kv } = require('@vercel/kv');
-const { put } = require('@vercel/blob');
-const { getMockup, render, findSmartObjectByName } = require('./_sudomock-client');
-const { buildBandImage } = require('./_build-band');
-const { PRODUCTS, PRODUCT_VARIATIONS } = require('./_mockup-config');
+// IMPORTANT: every require() below is deliberately done INSIDE the handler,
+// not at the top of the file. If a dependency fails to load correctly on
+// Vercel's specific build/bundling system (even if it works fine in local
+// testing), a top-level require() failure crashes the entire module before
+// any of our own error handling ever gets a chance to run — Vercel's own
+// platform error page replaces our response, silently dropping the CORS
+// headers, which is exactly what a bare "Failed to fetch" looks like from
+// the browser with zero information about the real cause. Requiring lazily,
+// inside the try/catch below, means even a broken/missing dependency comes
+// back as a real, readable JSON error instead of a silent total failure.
 
 const EXTERNAL_CALL_TIMEOUT_MS = 15000;
 
 module.exports = async (req, res) => {
-  // CORS — set FIRST, before anything that could possibly throw, and again
-  // this is why the whole rest of the function is wrapped below: nothing
-  // that happens later is allowed to prevent a real, headers-intact
-  // response from being sent.
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -46,18 +35,34 @@ module.exports = async (req, res) => {
     return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'Use POST.' });
   }
 
+  // Load every dependency here, inside the try/catch — see note above.
+  let formidable, fs, kv, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS;
   try {
-    return await handlePost(req, res);
+    ({ formidable } = require('formidable'));
+    fs = require('fs');
+    ({ kv } = require('@vercel/kv'));
+    ({ put } = require('@vercel/blob'));
+    ({ getMockup, render, findSmartObjectByName } = require('./_sudomock-client'));
+    ({ buildBandImage } = require('./_build-band'));
+    ({ PRODUCTS, PRODUCT_VARIATIONS } = require('./_mockup-config'));
   } catch (err) {
-    // Absolute last resort — should rarely fire given the handling inside
-    // handlePost, but guarantees we NEVER return a bare crash with no
-    // CORS headers, no matter what goes wrong.
+    console.error('DEPENDENCY LOAD FAILURE:', err);
+    return res.status(500).json({
+      code: 'DEPENDENCY_ERROR',
+      message: 'A required module failed to load on the server.',
+      debug: String((err && err.stack) || (err && err.message) || err),
+    });
+  }
+
+  try {
+    return await handlePost(req, res, { formidable, fs, kv, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS });
+  } catch (err) {
     console.error('UNCAUGHT top-level error:', err);
     if (!res.headersSent) {
       return res.status(500).json({
         code: 'INTERNAL_ERROR',
         message: 'Something went wrong generating your mock-ups.',
-        debug: String((err && err.message) || err),
+        debug: String((err && err.stack) || (err && err.message) || err),
       });
     }
   }
@@ -67,10 +72,12 @@ module.exports.config = {
   api: { bodyParser: false },
 };
 
-async function handlePost(req, res) {
+async function handlePost(req, res, deps) {
+  const { formidable, fs, kv, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS } = deps;
+
   let fields, files;
   try {
-    ({ fields, files } = await withTimeout(parseForm(req), EXTERNAL_CALL_TIMEOUT_MS, 'Reading the upload'));
+    ({ fields, files } = await withTimeout(parseForm(req, formidable), EXTERNAL_CALL_TIMEOUT_MS, 'Reading the upload'));
   } catch (err) {
     console.error('Upload parsing failed:', err);
     return res.status(400).json({ code: 'BAD_REQUEST', message: 'Could not read upload.', debug: String((err && err.message) || err) });
@@ -127,7 +134,7 @@ async function handlePost(req, res) {
   // --- Generate all 8 designs ---
   let designs;
   try {
-    designs = await generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessionId });
+    designs = await generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessionId, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS });
   } catch (err) {
     console.error('Mock-up generation failed:', err);
     return res.status(502).json({ code: 'GENERATION_FAILED', message: 'Could not generate mock-ups right now.', debug: String((err && err.message) || err) });
@@ -158,7 +165,7 @@ async function handlePost(req, res) {
   });
 }
 
-function parseForm(req) {
+function parseForm(req, formidable) {
   return new Promise((resolve, reject) => {
     const form = formidable({ multiples: false });
     form.parse(req, (err, fields, files) => {
@@ -176,7 +183,7 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-async function generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessionId }) {
+async function generateAllDesigns({ logoUrl, primaryColor, secondaryColor, sessionId, put, getMockup, render, findSmartObjectByName, buildBandImage, PRODUCTS, PRODUCT_VARIATIONS }) {
   const designs = [];
 
   for (const [productKey, config] of Object.entries(PRODUCTS)) {
